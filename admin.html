@@ -331,6 +331,11 @@ main{padding-bottom:60px}
     <button type="button" class="btn sm primary" id="resumeBtn">متابعة الإرسال</button>
     <button type="button" class="btn sm ghost" id="resumeDrop">إلغاء</button>
   </div>
+  <div class="banner" id="sharedBanner" hidden>
+    <span class="grow" id="sharedText"></span>
+    <button type="button" class="btn sm primary" id="sharedAdd">إضافتهم إلى القائمة المشتركة</button>
+    <button type="button" class="btn sm ghost" id="sharedSkip">تجاهل</button>
+  </div>
   <div class="banner" id="backupBanner" hidden>
     <span class="grow" id="backupText"></span>
     <button type="button" class="btn sm" id="backupNow">حفظ نسخة الآن</button>
@@ -568,12 +573,12 @@ main{padding-bottom:60px}
     <h3>الإرسال</h3>
     <div class="field"><label for="sDays">إرسال تذكير الرد بعد (أيام من الدعوة)</label><input id="sDays" type="number" min="0" name="rsvp_reminder_days" inputmode="numeric"></div>
     <h3>بياناتك</h3>
-    <p class="hint" style="margin-bottom:12px">قائمة الضيوف محفوظة في هذا المتصفح فقط (الردود والتذاكر محفوظة في الجدول). احفظ نسخة احتياطية، واستعدها للانتقال إلى جهاز آخر.</p>
+    <p class="hint" style="margin-bottom:12px">قائمة الضيوف والرسائل محفوظة في جدول Google ومشتركة بين كل من يستخدم اللوحة بمفتاح الإدارة. النسخة الاحتياطية اختيارية.</p>
     <div style="display:flex;flex-wrap:wrap;gap:10px">
       <button type="button" class="btn" id="backupBtn">حفظ نسخة احتياطية</button>
       <button type="button" class="btn" id="restoreBtn">استعادة نسخة</button>
       <input type="file" id="restoreFile" accept=".json" hidden>
-      <button type="button" class="btn danger" id="resetBtn">حذف جميع البيانات</button>
+      <button type="button" class="btn danger" id="resetBtn">مسح بيانات هذا المتصفح</button>
     </div>
     <div class="foot"><span class="grow"></span><button type="button" class="btn" data-close>إلغاء</button><button type="submit" class="btn primary">حفظ الإعدادات</button></div>
   </form>
@@ -670,7 +675,7 @@ const DB = {
 };
 
 const EMPTY = () => ({ settings: { ...DEFAULTS }, guests: [], nextId: 1, lastBackup: null, changesSinceBackup: 0,
-  replies: [], links: {}, ignored: {}, lastSync: null, openLinks: [], linkInfo: {}, session: null, deletedTokens: {} });
+  replies: [], links: {}, ignored: {}, lastSync: null, openLinks: [], linkInfo: {}, session: null, deletedTokens: {}, sharedOn: false, localOnly: null, settingsDirty: false });
 let S = EMPTY();
 let page = "home", filter = "all", query = "", oFilter = "all", oQuery = "", editing = null, sendKind = "invite", includeNotDue = false;
 const selected = new Set(), oSelected = new Set();
@@ -682,7 +687,7 @@ function normalizeState() {
   if (String(S.settings.msg_invite || "").startsWith("حضرة {full_name}،")) S.settings.msg_invite = S.settings.msg_invite.replace("حضرة {full_name}،", "حضرة {title} {full_name}،");
 }
 async function persist() { await DB.set("state", S); }
-async function save() { S.changesSinceBackup++; await persist(); render(); }
+async function save() { S.changesSinceBackup++; await persist(); render(); flush(); }
 async function loadAll() {
   await DB.open();
   const st = await DB.get("state");
@@ -768,6 +773,80 @@ function fmtPhone(d) {
   return "+" + (code ? code + " " : "") + parts.join(" ");
 }
 
+/* ---------- Shared list: the guest list, "sent" marks and messages live in the Google Sheet ---------- */
+const SHARED_KEYS = ["id", "title", "full_name", "phone", "note", "token", "status", "responded_at", "reply_stamp", "invited_at", "rsvp_reminder_at", "event_reminder_at"];
+const SHARED_SETTINGS = ["couple", "wedding_date", "venue", "map_url", "country_code", "rsvp_reminder_days", "msg_invite", "msg_rsvp_reminder", "msg_event_reminder"];
+const newId = () => "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const isDerived = (g) => String(g.id).startsWith("o:");          // built from a reply, not stored in the list
+const shared = () => sheetReady() && S.sharedOn;
+const dirty = (g) => { if (g && !isDerived(g)) g._dirty = 1; };
+const toRow = (g) => { const o = {}; SHARED_KEYS.forEach((k) => (o[k] = g[k] == null ? "" : String(g[k]))); return o; };
+const pickSettings = () => { const o = {}; SHARED_SETTINGS.forEach((k) => (o[k] = S.settings[k] ?? "")); return o; };
+let flushing = false, flushAgain = false;
+async function flush() {
+  if (!shared()) return;
+  if (flushing) { flushAgain = true; return; }
+  flushing = true;
+  try {
+    do {
+      flushAgain = false;
+      const list = S.guests.filter((g) => g._dirty && !isDerived(g));
+      if (list.length) {
+        const snap = list.map((g) => [g, JSON.stringify(toRow(g))]);
+        await api({ action: "upsertGuests", guests: list.map(toRow) });
+        snap.forEach(([g, j]) => { if (JSON.stringify(toRow(g)) === j) delete g._dirty; });
+        await persist();
+      }
+      if (S.settingsDirty) {
+        S.settingsDirty = false;
+        try { await api({ action: "saveSettings", settings: pickSettings() }); } catch (err) { S.settingsDirty = true; throw err; }
+        await persist();
+      }
+    } while (flushAgain);
+  } catch (err) { toast("لم تُحفظ التغييرات في الجدول بعد (" + err.message + "). ستُعاد المحاولة تلقائيًا."); }
+  finally { flushing = false; }
+}
+/* Replace this device's list with the shared one, keeping changes not yet saved and reply details. */
+function mergeFromSheet(data) {
+  const prev = new Map(S.guests.map((g) => [String(g.id), g]));
+  const seen = new Set(), list = [];
+  for (const row of data.guests) {
+    const id = String(row.id); if (!id || seen.has(id)) continue; seen.add(id);
+    const old = prev.get(id);
+    if (old && old._dirty) { list.push(old); continue; }
+    const g = { ...(old || {}) };
+    SHARED_KEYS.forEach((k) => (g[k] = row[k] == null ? "" : String(row[k])));
+    g.id = id; g.open = false;
+    g.phone = g.phone ? (normalizePhone(g.phone, S.settings.country_code) || g.phone.replace(/\D/g, "")) : "";
+    g.token = g.token || null;
+    const p = g.full_name.trim().split(/\s+/); g.first_name = p[0] || ""; g.last_name = p.slice(1).join(" ");
+    list.push(g);
+  }
+  const sheetToks = new Set(list.map((g) => g.token).filter(Boolean));
+  for (const g of prev.values()) if (!seen.has(String(g.id)) && (g._dirty || (isDerived(g) && !sheetToks.has(g.token)))) list.push(g);
+  S.guests = list;
+}
+function adoptShared(data) {
+  if (!S.sharedOn) {
+    S.sharedOn = true;
+    // First connection on this device: offer its own guests that the shared list doesn't have
+    const phones = new Set(data.guests.map((r) => String(r.phone || "").replace(/\D/g, ""))), toks = new Set(data.guests.map((r) => r.token).filter(Boolean));
+    const mine = S.guests.filter((g) => !g.open && !isDerived(g) && !(g.phone && phones.has(g.phone)) && !(g.token && toks.has(g.token)));
+    S.localOnly = mine.length ? mine.map((g) => { const c = { ...g }; delete c._dirty; return c; }) : null;
+    S.guests.forEach((g) => delete g._dirty);
+    S.session = null; S.links = {};
+    if (!Object.keys(data.settings || {}).length) S.settingsDirty = true;   // first device sets the shared messages
+  }
+  if (!S.settingsDirty) for (const k of SHARED_SETTINGS) if (data.settings && k in data.settings && data.settings[k] !== "") S.settings[k] = data.settings[k];
+  mergeFromSheet(data);
+}
+async function addLocalOnly() {
+  const list = (S.localOnly || []).map((g) => ({ ...g, id: newId(), open: false, _dirty: 1 }));
+  S.guests.push(...list); S.localOnly = null;
+  await save(); toast(`تمت إضافة ${list.length} ضيف إلى القائمة المشتركة`);
+  if (sheetReady()) ensureLinks(list).catch(() => {});
+}
+
 /* ---------- Google Sheet: connection, links, replies ---------- */
 let syncing = false;
 const sheetReady = () => !!(S.settings.sheet_url && S.settings.sheet_key);
@@ -796,8 +875,8 @@ async function ensureLinks(guests) {
     const chunk = need.slice(i, i + 300);
     const data = await api({ action: "createLinks", items: chunk.map((g) => ({ ref: g.id, name: g.full_name, phone: g.phone })) });
     for (const l of data.links || []) {
-      const g = S.guests.find((x) => x.id === l.ref);
-      if (g && !g.token) { g.token = l.token; made++; }
+      const g = S.guests.find((x) => String(x.id) === String(l.ref));
+      if (g && !g.token) { g.token = l.token; dirty(g); made++; }
     }
   }
   await save();
@@ -841,10 +920,12 @@ function applyReply(g, r) {
     const st = r.attending === "no" ? "declined" : "attending";
     if (g.status !== st) { g.status = st; changed = true; }
     g.responded_at = stamp;
+    dirty(g);
   }
   return changed;
 }
 
+let lastLinkToks = null;
 function applyReplies(replies) {
   S.replies = replies;
   const ids = new Set(S.guests.map((g) => g.id));
@@ -852,19 +933,19 @@ function applyReplies(replies) {
   const taken = new Set(Object.values(S.links));
   let changed = 0, unmatched = 0;
   for (const r of replies) {
-    if (S.ignored[r.id] || (r.token && S.deletedTokens[r.token])) continue;
+    if (S.ignored[r.id] || (r.token && (S.deletedTokens[r.token] || (lastLinkToks && !lastLinkToks.has(r.token))))) continue;
     let g = null;
     if (r.token) {
       g = S.guests.find((x) => x.token === r.token);
       if (!g) {
         const p = String(r.name || "").trim().split(/\s+/);
-        g = { id: S.nextId++, full_name: String(r.name || "").trim(), first_name: p[0] || "", last_name: p.slice(1).join(" "),
+        g = { id: "o:" + r.token, full_name: String(r.name || "").trim(), first_name: p[0] || "", last_name: p.slice(1).join(" "),
               phone: "", token: r.token, open: r.kind === "open", status: "pending", note: "" };
         S.guests.push(g); changed++;
       }
       S.links[r.id] = g.id; taken.add(g.id);
     } else {
-      g = S.links[r.id] != null ? S.guests.find((x) => x.id === S.links[r.id]) : null;
+      g = S.links[r.id] != null ? S.guests.find((x) => String(x.id) === String(S.links[r.id])) : null;
       if (!g) { g = findGuest(r, taken); if (g) { S.links[r.id] = g.id; taken.add(g.id); } }
       if (!g) { unmatched++; continue; }
     }
@@ -885,13 +966,14 @@ function mirrorSheet(data) {
   const drop = new Set();
   for (const g of S.guests) {
     if (linkToks && g.token && !linkToks.has(g.token)) {          // link row deleted in the Sheet
-      if (g.open) { drop.add(g.id); continue; }
-      g.token = null; changed++;
+      if (g.open || isDerived(g)) { drop.add(g.id); continue; }
+      g.token = null; dirty(g); changed++;
     }
     const hasReply = (g.token && toks.has(g.token)) || linked.has(g.id);
     if (g.reply_stamp && !hasReply) {                              // reply row deleted in the Sheet
-      if (g.open) { drop.add(g.id); continue; }
+      if (g.open || isDerived(g)) { drop.add(g.id); continue; }
       Object.assign(g, { status: "pending", responded_at: null, reply_stamp: null, reply_name: "", ticket: "", message: "", checked_at: "" });
+      dirty(g);
       changed++;
     }
   }
@@ -916,7 +998,7 @@ function applyLinkInfo(links) {
 async function syncReplies(silent) {
   if (syncing) return;
   if (!sheetReady()) { if (!silent) { toast("أدخل مفتاح الإدارة أولًا"); openSettings(); } return; }
-  if (silent && document.querySelector("dialog[open]")) return;
+  if (silent && document.querySelector("dialog[open]:not(#sessionDlg)")) return;   // never swap the list under an open form
   syncing = true; renderSync();
   try {
     const url = linkBase() + "?action=replies&key=" + encodeURIComponent(S.settings.sheet_key.trim());
@@ -924,12 +1006,16 @@ async function syncReplies(silent) {
     try { data = await (await fetch(url, { cache: "no-store" })).json(); }
     catch { throw new Error("تعذّر الوصول إلى الجدول. تأكد من الاتصال بالإنترنت."); }
     if (!data.ok) throw new Error(data.error === "bad key" ? "مفتاح الإدارة غير صحيح" : (data.error || "لم يستجب الجدول"));
+    lastLinkToks = Array.isArray(data.links) ? new Set(data.links.map((l) => l.token)) : null;
+    S.oldServer = !Array.isArray(data.guests);
+    if (!S.oldServer) adoptShared(data);
     applyLinkInfo(data.links);
     const res = applyReplies(data.replies || []);
     res.changed += mirrorSheet(data);
     S.lastSync = now();
     if (res.changed) S.changesSinceBackup++;
     await persist();
+    flush();
     if (!silent || res.changed) toast(res.changed ? `تم تحديث ${res.changed} ضيف من الجدول` + (res.unmatched ? ` · ${res.unmatched} يحتاج ربطًا` : "") : "لا جديد · كل الردود محدّثة");
   } catch (err) { if (!silent) toast(err.message); }
   finally { syncing = false; render(); }
@@ -963,7 +1049,7 @@ function renderMatches() {
   $("#matchList").querySelectorAll(".match").forEach((el) => {
     const rid = el.dataset.r;
     el.querySelector('[data-a="link"]').onclick = () => {
-      const gid = Number(el.querySelector("select").value);
+      const gid = el.querySelector("select").value;
       if (!gid) return toast("اختر الضيف أولًا");
       linkReply(rid, gid);
     };
@@ -971,7 +1057,7 @@ function renderMatches() {
   });
 }
 async function linkReply(rid, gid) {
-  const r = S.replies.find((x) => x.id === rid), g = S.guests.find((x) => x.id === gid);
+  const r = S.replies.find((x) => x.id === rid), g = S.guests.find((x) => String(x.id) === String(gid));
   if (!r || !g) return;
   for (const k in S.links) if (S.links[k] === gid) delete S.links[k];
   S.links[rid] = gid;
@@ -1009,7 +1095,12 @@ function render() {
   $("#tWishes").textContent = wishes;
   $("#tWishes").hidden = !wishes; $("#tOpen").hidden = !S.openLinks.length;
 
-  const needBackup = S.guests.length && S.changesSinceBackup >= 15;
+  const lo = S.localOnly && S.localOnly.length;
+  $("#sharedBanner").hidden = !(lo || (sheetReady() && S.oldServer));
+  $("#sharedAdd").hidden = $("#sharedSkip").hidden = !lo;
+  $("#sharedText").textContent = lo ? (lo === 1 ? "يوجد ضيف واحد محفوظ في هذا الجهاز فقط وغير موجود في القائمة المشتركة." : `يوجد ${lo} ضيوف محفوظون في هذا الجهاز فقط وغير موجودين في القائمة المشتركة.`)
+    : "القائمة غير موحّدة بين الأجهزة بعد: حدّث Code.gs في Apps Script ثم انشر نسخة جديدة.";
+  const needBackup = !shared() && S.guests.length && S.changesSinceBackup >= 15;
   $("#backupBanner").hidden = !needBackup;
   if (needBackup) $("#backupText").textContent = S.lastBackup
     ? `آخر نسخة احتياطية كانت في ${fmt(S.lastBackup)}. احفظ نسخة جديدة حتى لا تضيع التغييرات الأخيرة.`
@@ -1131,7 +1222,7 @@ function renderGuests() {
     </div>`;
   }).join("") || `<div class="empty">لا يوجد ضيوف مطابقون.</div>`);
   $("#guestList").querySelectorAll(".gr[data-id]").forEach((row) => (row.onclick = (e) => {
-    const g = S.guests.find((x) => x.id === Number(row.dataset.id)); if (!g) return;
+    const g = S.guests.find((x) => String(x.id) === row.dataset.id); if (!g) return;
     if (e.target.closest(".ck")) {
       if (e.target.tagName !== "INPUT") return;
       e.target.checked ? selected.add(g.id) : selected.delete(g.id);
@@ -1234,8 +1325,9 @@ function renderPreview() {
 let tplTimer;
 $("#msgTpl").oninput = (e) => {
   S.settings[MSG_KEY[sendKind]] = e.target.value;
+  S.settingsDirty = true;
   renderPreview();
-  clearTimeout(tplTimer); tplTimer = setTimeout(() => persist(), 400);
+  clearTimeout(tplTimer); tplTimer = setTimeout(() => { persist(); flush(); }, 800);
 };
 $$("#ins [data-ins]").forEach((b) => (b.onclick = () => {
   const ta = $("#msgTpl"), t = b.dataset.ins, st = ta.selectionStart ?? ta.value.length, en = ta.selectionEnd ?? st;
@@ -1333,11 +1425,11 @@ function markCurrent(st) {
   const ses = S.session, cur = sesGuest(ses.i);
   if (cur) {
     cur.it.st = st;
-    if (st === "sent") { cur.g[MARK[cur.it.kind]] = now(); ses.sent++; }
+    if (st === "sent") { cur.g[MARK[cur.it.kind]] = now(); dirty(cur.g); ses.sent++; }
   }
   ses.i++; advance();
 }
-async function sesSave() { S.changesSinceBackup++; await persist(); renderSession(); render(); }
+async function sesSave() { S.changesSinceBackup++; await persist(); renderSession(); render(); flush(); }
 // Links open WhatsApp natively (never blocked as a popup); the page updates right after the click.
 $("#qOpen").onclick = () => { S.session.state = "waiting"; setTimeout(sesSave, 0); };
 $("#qYesNext").onclick = () => { markCurrent("sent"); S.session.state = "waiting"; setTimeout(sesSave, 0); };
@@ -1373,11 +1465,16 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 $("#resumeBtn").onclick = openSession;
+$("#sharedAdd").onclick = addLocalOnly;
+$("#sharedSkip").onclick = async () => {
+  if (!confirm("تجاهل هؤلاء الضيوف؟ لن يُضافوا إلى القائمة المشتركة.")) return;
+  S.localOnly = null; await persist(); render();
+};
 $("#resumeDrop").onclick = async () => { S.session = null; await persist(); render(); };
 
 /* ---------- Guest dialog (add / edit) ---------- */
 function openGuest(id) {
-  const g = id == null ? null : S.guests.find((x) => x.id === id);
+  const g = id == null ? null : S.guests.find((x) => String(x.id) === String(id));
   editing = g;
   const f = $("#guestForm");
   $("#gTitle").textContent = g ? [g.title, g.full_name].filter(Boolean).join(" ") : "إضافة ضيف";
@@ -1426,7 +1523,9 @@ function applyGuestForm() {
   let g = editing;
   if (!phone && !(g && g.open)) throw new Error("أضف رقم واتساب");
   if (phone && S.guests.some((x) => x !== g && x.phone === phone)) throw new Error("هذا الرقم مسجّل لضيف آخر");
-  if (!g) { g = { id: S.nextId++, status: "pending", note: "" }; S.guests.push(g); editing = g; }
+  if (!g) { g = { id: newId(), status: "pending", note: "" }; S.guests.push(g); editing = g; }
+  if (isDerived(g) && !g.open) g.id = newId();   // a reply without a guest becomes a real guest once edited
+  dirty(g);
   g.full_name = name;
   const p = name.split(/\s+/); g.first_name = p[0] || ""; g.last_name = p.slice(1).join(" ");
   g.phone = phone; g.note = clean(f.note.value); g.title = clean(f.title.value);
@@ -1445,7 +1544,7 @@ $("#gSaveSend").onclick = async () => {
 };
 $("#gX").onclick = () => $("#guestDlg").close();
 $("#gCopy").onclick = () => copyText($("#gLink").value);
-$("#gUnsend").onclick = async () => { editing.invited_at = null; await save(); $("#guestDlg").close(); toast("اعتُبرت الدعوة غير مرسلة"); };
+$("#gUnsend").onclick = async () => { editing.invited_at = null; dirty(editing); await save(); $("#guestDlg").close(); toast("اعتُبرت الدعوة غير مرسلة"); };
 /* Deleting removes guests from this list and stops their replies from bringing them back on the next sync.
    (Their reply rows stay in the Google Sheet.) */
 /* Removes link rows in the Sheet so those links stop working. Returns false if Code.gs hasn't been updated yet. */
@@ -1457,7 +1556,10 @@ async function deleteLinksInSheet(tokens) {
 }
 async function deleteGuests(list, { skipSheet = false } = {}) {
   let sheetOk = true;
-  if (!skipSheet) sheetOk = await deleteLinksInSheet(list.map((g) => g.token));
+  if (shared()) {
+    const tokens = skipSheet ? [] : list.map((g) => g.token).filter(Boolean);
+    await api({ action: "deleteGuests", ids: list.filter((g) => !isDerived(g)).map((g) => String(g.id)), tokens });
+  } else if (!skipSheet) sheetOk = await deleteLinksInSheet(list.map((g) => g.token));
   const ids = new Set(list.map((g) => g.id));
   for (const g of list) if (g.token) S.deletedTokens[g.token] = true;
   for (const rid in S.links) if (ids.has(S.links[rid])) { S.ignored[rid] = true; delete S.links[rid]; }
@@ -1662,8 +1764,8 @@ function importRows(rows) {
     const extra = {};
     if (r.title !== null && r.title !== undefined) extra.title = clean(r.title);
     if (r.note) extra.note = clean(r.note);
-    if (existing) { Object.assign(existing, { full_name: full, first_name: firstN, last_name: last }, extra); updated++; }
-    else { S.guests.push({ id: S.nextId++, full_name: full, first_name: firstN, last_name: last, phone, status: "pending", note: "", title: "", ...extra }); added++; }
+    if (existing) { Object.assign(existing, { full_name: full, first_name: firstN, last_name: last }, extra); dirty(existing); updated++; }
+    else { S.guests.push({ _dirty: 1, id: newId(), full_name: full, first_name: firstN, last_name: last, phone, status: "pending", note: "", title: "", ...extra }); added++; }
   }
   return { added, updated, skipped };
 }
@@ -1748,6 +1850,7 @@ $("#setForm").onsubmit = async (e) => {
   out.sheet_url = (out.sheet_url || "").trim();
   out.sheet_key = (out.sheet_key || "").trim();
   S.settings = { ...S.settings, ...out };
+  S.settingsDirty = true;
   await save(); $("#setDlg").close(); toast("تم حفظ الإعدادات");
   if (sheetReady() && before !== out.sheet_url + "|" + out.sheet_key) syncReplies(false);
 };
@@ -1781,14 +1884,16 @@ $("#restoreFile").onchange = async (e) => {
     if (!S.settings.sheet_key && keepKey) S.settings.sheet_key = keepKey;
     S.settings.sheet_url = S.settings.sheet_url || DEFAULTS.sheet_url;
     normalizeState();
+    S.sharedOn = false; S.localOnly = null; S.settingsDirty = false;   // next sync offers its guests to the shared list
     await persist();
     $("#setDlg").close(); render(); toast("تمت استعادة النسخة");
     syncReplies(true);
   } catch (err) { toast(err.message); }
 };
 $("#resetBtn").onclick = async () => {
-  if (!confirm("حذف كل الضيوف والإعدادات من هذا المتصفح؟ احفظ نسخة احتياطية أولًا. (الردود والتذاكر في الجدول لن تتأثر.)")) return;
-  S = EMPTY(); await persist();
+  if (!confirm("مسح بيانات هذا المتصفح؟ القائمة المشتركة في الجدول لا تتأثر وستُحمَّل من جديد.")) return;
+  const keep = { sheet_url: S.settings.sheet_url, sheet_key: S.settings.sheet_key };
+  S = EMPTY(); Object.assign(S.settings, keep); await persist(); syncReplies(true);
   $("#setDlg").close(); render(); toast("تم حذف جميع البيانات");
 };
 
@@ -1811,7 +1916,7 @@ $$("[data-export]").forEach((b) => (b.onclick = () => {
 let toastTimer;
 function toast(msg) { $("#toast").textContent = msg; $("#toast").hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => ($("#toast").hidden = true), 3500); }
 
-setInterval(() => { if (!document.hidden) syncReplies(true); }, 120000);
+setInterval(() => { if (!document.hidden) syncReplies(true); }, 45000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
 go("home");
