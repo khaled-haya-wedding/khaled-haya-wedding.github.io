@@ -832,20 +832,32 @@ function adoptShared(data) {
     // First connection on this device: offer its own guests that the shared list doesn't have
     const phones = new Set(data.guests.map((r) => String(r.phone || "").replace(/\D/g, ""))), toks = new Set(data.guests.map((r) => r.token).filter(Boolean));
     const mine = S.guests.filter((g) => !g.open && !isDerived(g) && !(g.phone && phones.has(g.phone)) && !(g.token && toks.has(g.token)));
-    S.localOnly = mine.length ? mine.map((g) => { const c = { ...g }; delete c._dirty; return c; }) : null;
+    const older = S.localOnly || [];
+    S.localOnly = (mine.length || older.length) ? [...older, ...mine].map((g) => { const c = { ...g }; delete c._dirty; return c; }) : null;
     S.guests.forEach((g) => delete g._dirty);
     S.session = null; S.links = {};
     if (!Object.keys(data.settings || {}).length) S.settingsDirty = true;   // first device sets the shared messages
   }
   if (!S.settingsDirty) for (const k of SHARED_SETTINGS) if (data.settings && k in data.settings && data.settings[k] !== "") S.settings[k] = data.settings[k];
   mergeFromSheet(data);
+  if (S.localOnly && S.localOnly.length) joinLocalGuests();
 }
-async function addLocalOnly() {
-  const list = (S.localOnly || []).map((g) => ({ ...g, id: newId(), open: false, _dirty: 1 }));
-  S.guests.push(...list); S.localOnly = null;
-  await save(); toast(`تمت إضافة ${list.length} ضيف إلى القائمة المشتركة`);
-  if (sheetReady()) ensureLinks(list).catch(() => {});
+/* Adds guests that only this device had, skipping anyone already in the shared list (same phone or link). */
+function joinLocalGuests() {
+  const phones = new Set(S.guests.map((g) => g.phone).filter(Boolean)), toks = new Set(S.guests.map((g) => g.token).filter(Boolean));
+  const add = [];
+  for (const g of S.localOnly || []) {
+    if ((g.phone && phones.has(g.phone)) || (g.token && toks.has(g.token))) continue;
+    if (g.phone) phones.add(g.phone); if (g.token) toks.add(g.token);
+    add.push({ ...g, id: newId(), open: false, _dirty: 1 });
+  }
+  S.localOnly = null;
+  if (!add.length) return;
+  S.guests.push(...add);
+  setTimeout(() => toast(`تمت إضافة ${add.length} ضيف من هذا الجهاز إلى القائمة المشتركة`), 300);
+  if (sheetReady()) setTimeout(() => ensureLinks(add.filter((g) => !g.token)).catch(() => {}), 1500);
 }
+async function addLocalOnly() { joinLocalGuests(); await save(); }
 
 /* ---------- Google Sheet: connection, links, replies ---------- */
 let syncing = false;
@@ -1008,6 +1020,7 @@ async function syncReplies(silent) {
     if (!data.ok) throw new Error(data.error === "bad key" ? "مفتاح الإدارة غير صحيح" : (data.error || "لم يستجب الجدول"));
     lastLinkToks = Array.isArray(data.links) ? new Set(data.links.map((l) => l.token)) : null;
     S.oldServer = !Array.isArray(data.guests);
+    lastSyncError = "";
     if (!S.oldServer) adoptShared(data);
     applyLinkInfo(data.links);
     const res = applyReplies(data.replies || []);
@@ -1017,15 +1030,20 @@ async function syncReplies(silent) {
     await persist();
     flush();
     if (!silent || res.changed) toast(res.changed ? `تم تحديث ${res.changed} ضيف من الجدول` + (res.unmatched ? ` · ${res.unmatched} يحتاج ربطًا` : "") : "لا جديد · كل الردود محدّثة");
-  } catch (err) { if (!silent) toast(err.message); }
+  } catch (err) { lastSyncError = err.message; if (!silent) toast(err.message); }
   finally { syncing = false; render(); }
 }
-
+let lastSyncError = "";
 function renderSync() {
   const b = $("#syncBtn"), dot = $("#syncDot"), t = $("#syncTxt");
   b.disabled = syncing;
-  dot.className = "dot " + (sheetReady() ? "ok" : "warn");
-  t.textContent = syncing ? "جارٍ التحديث…" : sheetReady() ? (S.lastSync ? `متصل · ${hhmm(S.lastSync)}` : "متصل · تحديث") : "أدخل مفتاح الإدارة";
+  const age = S.lastSync ? (Date.now() - Date.parse(S.lastSync)) / 1000 : Infinity;
+  const unsaved = S.guests.filter((g) => g._dirty && !isDerived(g)).length + (S.settingsDirty ? 1 : 0);
+  const bad = !sheetReady() || S.oldServer || lastSyncError || age > 120;
+  dot.className = "dot " + (bad ? "warn" : "ok");
+  t.textContent = syncing ? "جارٍ التحديث…" : !sheetReady() ? "أدخل مفتاح الإدارة"
+    : lastSyncError ? "غير متصل · اضغط للمحاولة" : S.oldServer ? "Apps Script قديم"
+    : unsaved ? "جارٍ الحفظ…" : age < 60 ? "مباشر · محدّث الآن" : `مباشر · قبل ${Math.round(age / 60)} د`;
   b.title = sheetReady() ? "تحديث الردود الآن" : "الإعدادات";
   b.setAttribute("aria-label", sheetReady() ? "تحديث الردود" : "أدخل مفتاح الإدارة");
 }
@@ -1099,7 +1117,7 @@ function render() {
   $("#sharedBanner").hidden = !(lo || (sheetReady() && S.oldServer));
   $("#sharedAdd").hidden = $("#sharedSkip").hidden = !lo;
   $("#sharedText").textContent = lo ? (lo === 1 ? "يوجد ضيف واحد محفوظ في هذا الجهاز فقط وغير موجود في القائمة المشتركة." : `يوجد ${lo} ضيوف محفوظون في هذا الجهاز فقط وغير موجودين في القائمة المشتركة.`)
-    : "القائمة غير موحّدة بين الأجهزة بعد: حدّث Code.gs في Apps Script ثم انشر نسخة جديدة.";
+    : "⚠ القائمة غير موحّدة: Apps Script يعمل بنسخة قديمة. افتح Apps Script ← Deploy ← Manage deployments ← New version ← Deploy.";
   const needBackup = !shared() && S.guests.length && S.changesSinceBackup >= 15;
   $("#backupBanner").hidden = !needBackup;
   if (needBackup) $("#backupText").textContent = S.lastBackup
@@ -1916,10 +1934,27 @@ $$("[data-export]").forEach((b) => (b.onclick = () => {
 let toastTimer;
 function toast(msg) { $("#toast").textContent = msg; $("#toast").hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => ($("#toast").hidden = true), 3500); }
 
-setInterval(() => { if (!document.hidden) syncReplies(true); }, 45000);
+setInterval(() => { if (!document.hidden) syncReplies(true); }, 15000);   // live: other admins' changes appear within ~15 s
+setInterval(renderSync, 10000);
+window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
+const BUILD = "2026-10-28b";
+async function checkUpdate() {
+  try {
+    const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
+    const m = t.match(/const BUILD = "([^"]+)"/);
+    if (m && m[1] !== BUILD) {
+      const busy = document.querySelector("dialog[open]") || (S.session && S.session.state === "waiting") || S.guests.some((g) => g._dirty);
+      if (busy) { setTimeout(checkUpdate, 30000); return; }
+      await persist(); location.reload();
+    }
+  } catch {}
+}
+setInterval(() => { if (!document.hidden) checkUpdate(); }, 120000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkUpdate(); });
 go("home");
+setTimeout(checkUpdate, 5000);
 loadAll().catch((e) => info("هذا المتصفح لا يسمح بحفظ البيانات", "افتح الصفحة في Chrome أو Safari أو Edge (ليس في نافذة خاصة). " + e.message));
 </script>
 </body>
