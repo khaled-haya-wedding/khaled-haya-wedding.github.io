@@ -583,6 +583,7 @@ main{padding-bottom:60px}
       <button type="button" class="btn" id="restoreBtn">استعادة نسخة</button>
       <button type="button" class="btn" id="dupFix2">دمج الضيوف المكررين</button>
       <button type="button" class="btn" id="repairBtn">استعادة الضيوف من نسخة قديمة</button>
+      <button type="button" class="btn" id="auditBtn">تقرير التحقق من الأعداد</button>
       <input type="file" id="restoreFile" accept=".json" hidden>
       <button type="button" class="btn danger" id="resetBtn">مسح بيانات هذا المتصفح</button>
     </div>
@@ -1560,6 +1561,27 @@ $("#sharedAdd").onclick = addLocalOnly;
 $("#dupFix").onclick = fixDuplicates;
 $("#dupFix2").onclick = () => { $("#setDlg").close(); fixDuplicates(); };
 $("#dupGo").onclick = runDedupe;
+$("#auditBtn").onclick = async () => {
+  $("#setDlg").close(); toast("جارٍ التحقق…");
+  try {
+    const a = await api({ action: "audit" });
+    const lines = [
+      `الردود في تبويب RSVP (روابط شخصية): ${a.rsvpYes} سيحضر · ${a.rsvpNo} اعتذر`,
+      `الردود في تبويب الروابط المفتوحة: ${a.openYes} سيحضر · ${a.openNo} اعتذر`,
+      `إجمالي من أكّدوا الحضور (بدون تكرار): ${a.uniqueYes}`,
+      `قائمة الضيوف: ${a.listTotal} ضيف، منهم ${a.listAttending} «سيحضر»`,
+    ];
+    const items = [];
+    if (a.notInList.length) { lines.push(`⚠ ${a.notInList.length} أكّدوا حضورهم لكنهم غير موجودين في قائمة الضيوف:`); a.notInList.forEach((r) => items.push(`✓ ${r.name}${r.ticket ? " · تذكرة " + r.ticket : ""}${r.linkDeleted ? " · رابطه محذوف" : ""}`)); }
+    if (a.old) {
+      lines.push(`مقارنة مع «${a.old.name}»: كانت ${a.old.total} ضيف (${a.old.attending} سيحضر).`);
+      if (a.old.missing.length) { lines.push(`⚠ ${a.old.missing.length} ضيف كانوا في النسخة القديمة ومفقودون الآن — اضغط «استعادة الضيوف من نسخة قديمة» لإعادتهم.`); a.old.missing.forEach((m) => items.push(`${m.attending ? "✓ سيحضر · " : ""}${m.name} ${m.phone}`)); }
+      else lines.push("لا أحد مفقود مقارنة بالنسخة القديمة.");
+    }
+    info("تقرير التحقق من الأعداد", lines.join("\n"), items);
+    $("#infoText").style.whiteSpace = "pre-line";
+  } catch (err) { toast(/رابط|Apps/.test(err.message) ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
+};
 $("#repairBtn").onclick = async () => {
   if (!confirm("استعادة الضيوف الذين حذفهم الدمج من تبويب «نسخة من الضيوف»؟ الردود والتسجيلات الحالية لا تتأثر، وتُحفظ نسخة احتياطية أولًا.")) return;
   $("#setDlg").close(); toast("جارٍ الاستعادة…");
@@ -2026,7 +2048,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-29c";
+const BUILD = "2026-10-29d";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
