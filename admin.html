@@ -579,6 +579,7 @@ main{padding-bottom:60px}
     <h3>بياناتك</h3>
     <p class="hint" style="margin-bottom:12px">قائمة الضيوف والرسائل محفوظة في جدول Google ومشتركة بين كل من يستخدم اللوحة بمفتاح الإدارة. النسخة الاحتياطية اختيارية.</p>
     <div style="display:flex;flex-wrap:wrap;gap:10px">
+      <button type="button" class="btn primary" id="rebuildBtn">إصلاح القائمة والأعداد من الردود</button>
       <button type="button" class="btn" id="backupBtn">حفظ نسخة احتياطية</button>
       <button type="button" class="btn" id="restoreBtn">استعادة نسخة</button>
       <button type="button" class="btn" id="dupFix2">دمج الضيوف المكررين</button>
@@ -597,6 +598,16 @@ main{padding-bottom:60px}
     <p class="hint" id="dupDlgText" style="margin-bottom:12px"></p>
     <div class="skipped" id="dupDlgList" style="max-height:50vh"></div>
     <div class="foot"><span class="grow"></span><button type="button" class="btn" data-close>إلغاء</button><button type="button" class="btn primary" id="dupGo">دمج</button></div>
+  </div>
+</dialog>
+
+<dialog id="rebuildDlg" class="wide">
+  <div class="dlg">
+    <div class="dlghead"><h2>إصلاح القائمة والأعداد</h2><button type="button" class="iconbtn" data-close aria-label="إغلاق"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+    <p class="hint" id="rbText" style="margin:0 0 12px;white-space:pre-line;line-height:1.9"></p>
+    <div id="rbAmb"></div>
+    <details style="margin-top:10px"><summary class="hint" style="cursor:pointer">تفاصيل الدمج والمطابقة</summary><div class="skipped" id="rbList" style="max-height:40vh"></div></details>
+    <div class="foot"><span class="grow"></span><button type="button" class="btn" data-close>إلغاء</button><button type="button" class="btn primary" id="rbGo">تطبيق الإصلاح</button></div>
   </div>
 </dialog>
 
@@ -1020,6 +1031,11 @@ function applyReplies(replies) {
     let g = null;
     if (r.token) {
       g = S.guests.find((x) => x.token === r.token);
+      if (g && isDerived(g) && !g.open) {   // a stand-in made earlier: hand the reply to the real guest once the list has them
+        const lp = lastLinkPhone[r.token];
+        const real = (lp && S.guests.find((x) => !x.open && !isDerived(x) && x.phone === lp.phone && sameName(x.full_name, lp.name))) || findGuest(r, busy);
+        if (real) { S.guests = S.guests.filter((x) => x !== g); g = real; changed++; }
+      }
       if (!g && lastLinkPhone[r.token]) g = S.guests.find((x) => !x.open && !isDerived(x) && x.phone === lastLinkPhone[r.token].phone && sameName(x.full_name, lastLinkPhone[r.token].name));
       if (!g && r.kind !== "open") g = S.guests.find((x) => String(x.id) === String(S.links[r.id] ?? "")) || findGuest(r, busy);   // link gone: same person by name
       if (!g && deleted) continue;
@@ -1589,6 +1605,45 @@ $("#auditBtn").onclick = async () => {
     $("#infoText").style.whiteSpace = "pre-line";
   } catch (err) { toast(/رابط|Apps/.test(err.message) ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
 };
+function rbChoices() {
+  const c = {};
+  $("#rbAmb").querySelectorAll("select[data-tok]").forEach((x) => { if (x.value) c[x.dataset.tok] = x.value; });
+  return c;
+}
+function rbShow(r) {
+  const n = (x) => Number(x).toLocaleString("ar-EG");
+  $("#rbText").textContent = [
+    `قائمة الضيوف الآن: ${n(r.before)} سطر — بعد الإصلاح: ${n(r.after)} ضيف (سطر واحد لكل شخص).`,
+    `سيحضر: ${n(r.counts.attending)} · اعتذر: ${n(r.counts.declined)} · لم يرد: ${n(r.counts.pending)}`,
+    `يُدمج ${n(r.merges)} شخص لهم أكثر من سطر، ويُربط ${n(r.byName.length)} ردًا باسم صاحبه، ويُعاد ${n(r.relinked)} رابط محذوف حتى تعمل دعوة الضيف وتذكرته.`,
+    r.unmatched.length ? `${n(r.unmatched.length)} ردّوا وليسوا في القائمة — سيُضافون: ${r.unmatched.map((u) => u.reply + (u.yes ? " (سيحضر)" : " (اعتذر)")).join("، ")}` : "",
+    "الردود والتهاني لا تتغير، وتُحفظ نسخة احتياطية من الضيوف والروابط قبل التطبيق.",
+  ].filter(Boolean).join("\n");
+  $("#rbAmb").innerHTML = r.ambiguous.map((a) => `<label class="field" style="display:block;margin:8px 0"><span>ردّ «${esc(a.reply)}» (${a.yes ? "سيحضر" : "اعتذر"}) — من صاحبه؟</span>
+    <select data-tok="${esc(a.token)}"><option value="">لا أعرف — اتركه بدون ربط</option>${a.options.map((o) => `<option value="${esc(o.id)}">${esc(o.name)} ${o.phone ? "· " + esc(o.phone) : "· بدون رقم"}</option>`).join("")}</select></label>`).join("");
+  $("#rbList").innerHTML = r.mergeList.map((m) => `<div>دمج ${m.copies} أسطر ← ${esc(m.keep)} ${esc(m.phone)}</div>`).join("")
+    + r.byName.map((b) => `<div>ردّ «${esc(b.reply)}» ← ${esc(b.guest)} ${esc(b.phone)}</div>`).join("");
+}
+$("#rebuildBtn").onclick = async () => {
+  $("#setDlg").close(); toast("جارٍ الفحص…");
+  try {
+    await flush();
+    const r = await api({ action: "rebuild", preview: true });
+    rbShow(r); $("#rebuildDlg").showModal();
+  } catch (err) { toast(/rebuild|Unknown|رابط|Apps/i.test(err.message) ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
+};
+$("#rbGo").onclick = async () => {
+  const choices = rbChoices();
+  $("#rebuildDlg").close(); toast("جارٍ الإصلاح…");
+  try {
+    await flush();
+    const r = await api({ action: "rebuild", choices });
+    selected.clear(); S.session = null;
+    await syncReplies(true);
+    info("تم الإصلاح", `القائمة الآن ${r.after} ضيف: ${r.counts.attending} سيحضر · ${r.counts.declined} اعتذر · ${r.counts.pending} لم يرد.\nالنسخة الاحتياطية في تبويب «${r.backup}».`);
+    $("#infoText").style.whiteSpace = "pre-line";
+  } catch (err) { toast(err.message); }
+};
 $("#repairBtn").onclick = async () => {
   if (!confirm("استعادة الضيوف الذين حذفهم الدمج من تبويب «نسخة من الضيوف»؟ الردود والتسجيلات الحالية لا تتأثر، وتُحفظ نسخة احتياطية أولًا.")) return;
   $("#setDlg").close(); toast("جارٍ الاستعادة…");
@@ -2055,7 +2110,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-29e";
+const BUILD = "2026-10-30a";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
