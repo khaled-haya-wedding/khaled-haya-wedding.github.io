@@ -859,7 +859,8 @@ function mergeFromSheet(data) {
     list.push(g);
   }
   const sheetToks = new Set(list.map((g) => g.token).filter(Boolean));
-  for (const g of prev.values()) if (!seen.has(String(g.id)) && (g._dirty || (isDerived(g) && !sheetToks.has(g.token)))) list.push(g);
+  // keep only guests added here and not saved yet; a guest that was in the Sheet and is gone now was removed there (merge/repair/delete)
+  for (const g of prev.values()) if (!seen.has(String(g.id)) && ((g._dirty && !g._base && String(g.full_name || "").trim()) || (isDerived(g) && !sheetToks.has(g.token)))) list.push(g);
   S.guests = list;
 }
 function adoptShared(data) {
@@ -906,6 +907,7 @@ function dupCount() {
   const groups = []; let n = 0;
   for (const g of S.guests) {
     if (g.open || isDerived(g)) continue;
+    if (!String(g.full_name || "").trim() && !g.phone) { n++; continue; }   // empty row
     const hit = groups.find((x) => x.ph === (g.phone || "") && (g.phone ? sameName(x.name, g.full_name) : normName(x.name) === normName(g.full_name)));
     if (hit) n++; else groups.push({ ph: g.phone || "", name: g.full_name });
   }
@@ -916,9 +918,13 @@ async function fixDuplicates() {
   try {
     await flush();
     const pv = await api({ action: "dedupeGuests", preview: true });
-    if (!pv.groups || !pv.groups.length) { toast("لا يوجد مكررون"); return; }
+    const blanks = pv.blanks || 0;
+    pv.groups = (pv.groups || []).filter((g) => String(g.keep || "").trim() || g.phone);
+    if (!pv.groups.length && !blanks) { toast("لا يوجد مكررون"); return; }
     const total = pv.groups.reduce((a, g) => a + g.copies - 1, 0);
-    $("#dupDlgText").textContent = `سيُدمج ${pv.groups.length} ضيف (${total} نسخة مكررة). راجع القائمة: كل سطر شخص واحد بنفس الجوال والاسم. تُحفظ نسخة احتياطية كاملة في الجدول قبل الدمج.`;
+    $("#dupDlgText").textContent = [pv.groups.length ? `سيُدمج ${pv.groups.length} ضيف (${total} نسخة مكررة). راجع القائمة: كل سطر شخص واحد بنفس الجوال والاسم.` : "",
+      blanks ? `ويُحذف ${blanks} سطر فارغ (بلا اسم ولا رقم).` : "", "تُحفظ نسخة احتياطية كاملة في الجدول قبل الدمج."].filter(Boolean).join(" ");
+    $("#dupDlgList").hidden = !pv.groups.length;
     $("#dupDlgList").innerHTML = pv.groups.map((g) => `<div style="padding:6px 0;border-top:1px solid var(--line)"><b dir="auto">${esc(g.keep)}</b> <span class="sub ltr">${esc(g.phone)}</span> <span class="sub">· ${g.copies} نسخ</span>${g.names.some((n) => n !== g.keep) ? `<div class="sub" dir="auto">${esc([...new Set(g.names)].join(" / "))}</div>` : ""}</div>`).join("");
     $("#dupDlg").showModal();
   } catch (err) { toast(/رابط|Apps|قديم/.test(err.message) ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
@@ -2110,7 +2116,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-30a";
+const BUILD = "2026-10-30b";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
