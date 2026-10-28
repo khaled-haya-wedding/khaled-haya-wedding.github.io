@@ -333,7 +333,7 @@ main{padding-bottom:60px}
   </div>
   <div class="banner" id="dupBanner" hidden style="background:#3A1A1F;border-color:#8A3A48;color:#F7C3CA">
     <span class="grow" id="dupText"></span>
-    <button type="button" class="btn sm primary" id="dupFix">دمج المكررين</button>
+    <button type="button" class="btn sm primary" id="dupFix">مراجعة المكررين</button>
   </div>
   <div class="banner" id="sharedBanner" hidden>
     <span class="grow" id="sharedText"></span>
@@ -582,11 +582,21 @@ main{padding-bottom:60px}
       <button type="button" class="btn" id="backupBtn">حفظ نسخة احتياطية</button>
       <button type="button" class="btn" id="restoreBtn">استعادة نسخة</button>
       <button type="button" class="btn" id="dupFix2">دمج الضيوف المكررين</button>
+      <button type="button" class="btn" id="repairBtn">استعادة الضيوف من نسخة قديمة</button>
       <input type="file" id="restoreFile" accept=".json" hidden>
       <button type="button" class="btn danger" id="resetBtn">مسح بيانات هذا المتصفح</button>
     </div>
     <div class="foot"><span class="grow"></span><button type="button" class="btn" data-close>إلغاء</button><button type="submit" class="btn primary">حفظ الإعدادات</button></div>
   </form>
+</dialog>
+
+<dialog id="dupDlg" class="wide">
+  <div class="dlg">
+    <div class="dlghead"><h2>مراجعة الضيوف المكررين</h2><button type="button" class="iconbtn" data-close aria-label="إغلاق"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+    <p class="hint" id="dupDlgText" style="margin-bottom:12px"></p>
+    <div class="skipped" id="dupDlgList" style="max-height:50vh"></div>
+    <div class="foot"><span class="grow"></span><button type="button" class="btn" data-close>إلغاء</button><button type="button" class="btn primary" id="dupGo">دمج</button></div>
+  </div>
 </dialog>
 
 <dialog id="infoDlg">
@@ -871,25 +881,45 @@ function joinLocalGuests() {
   setTimeout(() => toast(`تمت إضافة ${add.length} ضيف من هذا الجهاز إلى القائمة المشتركة`), 300);
   if (sheetReady()) setTimeout(() => ensureLinks(add.filter((g) => !g.token)).catch(() => {}), 1500);
 }
+/* Same person = same phone AND same name (or one name is a shorter form of the other).
+   Family members who share one phone stay separate. */
+function sameName(a, b) {
+  a = normName(a); b = normName(b);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const A = a.split(" "), B = b.split(" "), sh = A.length <= B.length ? A : B, lo = A.length <= B.length ? B : A;
+  return sh[0] === lo[0] && sh.every((w) => lo.includes(w));
+}
 function dupCount() {
-  const seen = new Set(); let n = 0;
+  const groups = []; let n = 0;
   for (const g of S.guests) {
     if (g.open || isDerived(g)) continue;
-    const k = g.phone || "n:" + normName(g.full_name);
-    if (seen.has(k)) n++; else seen.add(k);
+    const hit = groups.find((x) => x.ph === (g.phone || "") && (g.phone ? sameName(x.name, g.full_name) : normName(x.name) === normName(g.full_name)));
+    if (hit) n++; else groups.push({ ph: g.phone || "", name: g.full_name });
   }
   return n;
 }
 async function fixDuplicates() {
   if (!shared()) return toast("أدخل مفتاح الإدارة وحدّث Code.gs أولًا");
-  const b = $("#dupFix"); b.disabled = true; toast("جارٍ دمج المكررين…");
   try {
     await flush();
+    const pv = await api({ action: "dedupeGuests", preview: true });
+    if (!pv.groups || !pv.groups.length) { toast("لا يوجد مكررون"); return; }
+    const total = pv.groups.reduce((a, g) => a + g.copies - 1, 0);
+    $("#dupDlgText").textContent = `سيُدمج ${pv.groups.length} ضيف (${total} نسخة مكررة). راجع القائمة: كل سطر شخص واحد بنفس الجوال والاسم. تُحفظ نسخة احتياطية كاملة في الجدول قبل الدمج.`;
+    $("#dupDlgList").innerHTML = pv.groups.map((g) => `<div style="padding:6px 0;border-top:1px solid var(--line)"><b dir="auto">${esc(g.keep)}</b> <span class="sub ltr">${esc(g.phone)}</span> <span class="sub">· ${g.copies} نسخ</span>${g.names.some((n) => n !== g.keep) ? `<div class="sub" dir="auto">${esc([...new Set(g.names)].join(" / "))}</div>` : ""}</div>`).join("");
+    $("#dupDlg").showModal();
+  } catch (err) { toast(/رابط|Apps|قديم/.test(err.message) ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
+}
+async function runDedupe() {
+  const b = $("#dupGo"); b.disabled = true; toast("جارٍ الدمج…");
+  try {
     const r = await api({ action: "dedupeGuests" });
     selected.clear(); S.session = null;
+    $("#dupDlg").close();
     await syncReplies(true);
-    toast(r.removed ? `تم دمج ${r.groups} ضيف وحذف ${r.removed} نسخة مكررة` : "لا يوجد مكررون");
-  } catch (err) { toast(err.message.includes("رابط") ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
+    info("تم الدمج", `حُذفت ${r.removed} نسخة مكررة. حُفظت نسخة احتياطية في الجدول باسم «${r.backup}» إن احتجت للرجوع.`);
+  } catch (err) { toast(err.message); }
   finally { b.disabled = false; render(); }
 }
 async function addLocalOnly() { joinLocalGuests(); await save(); }
@@ -984,7 +1014,7 @@ function applyReplies(replies) {
     let g = null;
     if (r.token) {
       g = S.guests.find((x) => x.token === r.token);
-      if (!g && lastLinkPhone[r.token]) g = S.guests.find((x) => !x.open && !isDerived(x) && x.phone === lastLinkPhone[r.token]);
+      if (!g && lastLinkPhone[r.token]) g = S.guests.find((x) => !x.open && !isDerived(x) && x.phone === lastLinkPhone[r.token].phone && sameName(x.full_name, lastLinkPhone[r.token].name));
       if (!g) {
         const p = String(r.name || "").trim().split(/\s+/);
         g = { id: "o:" + r.token, full_name: String(r.name || "").trim(), first_name: p[0] || "", last_name: p.slice(1).join(" "),
@@ -1046,7 +1076,7 @@ function applyLinkInfo(links) {
 async function syncReplies(silent) {
   if (syncing) return;
   if (!sheetReady()) { if (!silent) { toast("أدخل مفتاح الإدارة أولًا"); openSettings(); } return; }
-  if (silent && document.querySelector("dialog[open]:not(#sessionDlg)")) return;   // never swap the list under an open form
+  if (silent && document.querySelector("#guestDlg[open], #setDlg[open]")) return;   // never swap the list under an open edit form
   syncing = true; renderSync();
   try {
     const startedAt = Date.now();
@@ -1056,7 +1086,7 @@ async function syncReplies(silent) {
     catch { throw new Error("تعذّر الوصول إلى الجدول. تأكد من الاتصال بالإنترنت."); }
     if (!data.ok) throw new Error(data.error === "bad key" ? "مفتاح الإدارة غير صحيح" : (data.error || "لم يستجب الجدول"));
     lastLinkToks = Array.isArray(data.links) ? new Set(data.links.map((l) => l.token)) : null;
-    lastLinkPhone = {}; (data.links || []).forEach((l) => { if (l.phone && l.kind !== "open") lastLinkPhone[l.token] = l.phone; });
+    lastLinkPhone = {}; (data.links || []).forEach((l) => { if (l.phone && l.name && l.kind !== "open") lastLinkPhone[l.token] = { phone: l.phone, name: l.name }; });
     S.oldServer = !Array.isArray(data.guests);
     lastSyncError = "";
     // a save finished while this read was in flight: the read may be older than our save, so read again
@@ -1155,7 +1185,7 @@ function render() {
 
   const dups = dupCount();
   $("#dupBanner").hidden = !(dups && shared());
-  $("#dupText").textContent = `يوجد ${dups} ${dups === 1 ? "ضيف مكرر" : "ضيوف مكررين"} في القائمة (نفس رقم الجوال). الدمج يحتفظ بالرد والتذكرة وعلامات الإرسال.`;
+  $("#dupText").textContent = `يوجد ${dups} ${dups === 1 ? "ضيف مكرر" : "ضيوف مكررين"} في القائمة (نفس الجوال ونفس الاسم). ستُعرض عليك القائمة قبل الدمج.`;
   const lo = S.localOnly && S.localOnly.length;
   $("#sharedBanner").hidden = !(lo || (sheetReady() && S.oldServer));
   $("#sharedAdd").hidden = $("#sharedSkip").hidden = !lo;
@@ -1527,8 +1557,20 @@ document.addEventListener("visibilitychange", () => {
 });
 $("#resumeBtn").onclick = openSession;
 $("#sharedAdd").onclick = addLocalOnly;
-$("#dupFix").onclick = () => { if (confirm("دمج الضيوف المكررين؟ يبقى لكل ضيف سجل واحد بردّه وتذكرته وعلامات الإرسال.")) fixDuplicates(); };
-$("#dupFix2").onclick = () => { $("#setDlg").close(); if (confirm("دمج الضيوف المكررين؟ يبقى لكل ضيف سجل واحد بردّه وتذكرته وعلامات الإرسال.")) fixDuplicates(); };
+$("#dupFix").onclick = fixDuplicates;
+$("#dupFix2").onclick = () => { $("#setDlg").close(); fixDuplicates(); };
+$("#dupGo").onclick = runDedupe;
+$("#repairBtn").onclick = async () => {
+  if (!confirm("استعادة الضيوف الذين حذفهم الدمج من تبويب «نسخة من الضيوف»؟ الردود والتسجيلات الحالية لا تتأثر، وتُحفظ نسخة احتياطية أولًا.")) return;
+  $("#setDlg").close(); toast("جارٍ الاستعادة…");
+  try {
+    await flush();
+    const r = await api({ action: "repairFromCopy" });
+    selected.clear(); S.session = null;
+    await syncReplies(true);
+    info("تمت الاستعادة", `أُعيد ${r.restored} ضيف، وصُحّح ${r.fixed} سجل، وأُعيد ${r.links} رابط. الردود والتسجيلات الأخيرة كما هي.`, r.names || []);
+  } catch (err) { toast(err.message); }
+};
 $("#sharedSkip").onclick = async () => {
   if (!confirm("تجاهل هؤلاء الضيوف؟ لن يُضافوا إلى القائمة المشتركة.")) return;
   S.localOnly = null; await persist(); render();
@@ -1984,7 +2026,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-29a";
+const BUILD = "2026-10-29c";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
