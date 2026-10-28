@@ -968,7 +968,7 @@ async function copyText(t, label = "تم نسخ الرابط") {
 
 function findGuest(reply, taken) {
   const n = normName(reply.name); if (!n) return null;
-  const pool = S.guests.filter((g) => !taken.has(g.id) && !g.open);
+  const pool = S.guests.filter((g) => !taken.has(g.id) && !g.open && !isDerived(g));
   let hit = pool.filter((g) => normName(g.full_name) === n);
   if (hit.length === 1) return hit[0];
   if (hit.length > 1) return null;
@@ -1009,13 +1009,20 @@ function applyReplies(replies) {
   const ids = new Set(S.guests.map((g) => g.id));
   for (const k in S.links) if (!ids.has(S.links[k])) delete S.links[k];
   const taken = new Set(Object.values(S.links));
+  // guests who answered through their own link are never given someone else's reply
+  const replyToks = new Set(replies.filter((r) => r.token).map((r) => r.token));
+  const busy = new Set([...taken, ...S.guests.filter((g) => g.token && replyToks.has(g.token)).map((g) => g.id)]);
   let changed = 0, unmatched = 0;
   for (const r of replies) {
-    if (S.ignored[r.id] || (r.token && (S.deletedTokens[r.token] || (lastLinkToks && !lastLinkToks.has(r.token))))) continue;
+    // a reply always counts, even if its link was deleted later (e.g. when duplicates were removed)
+    if (S.ignored[r.id]) continue;
+    const deleted = !!(r.token && S.deletedTokens[r.token]);   // its guest was deleted here: only keep it if the same person is still listed
     let g = null;
     if (r.token) {
       g = S.guests.find((x) => x.token === r.token);
       if (!g && lastLinkPhone[r.token]) g = S.guests.find((x) => !x.open && !isDerived(x) && x.phone === lastLinkPhone[r.token].phone && sameName(x.full_name, lastLinkPhone[r.token].name));
+      if (!g && r.kind !== "open") g = S.guests.find((x) => String(x.id) === String(S.links[r.id] ?? "")) || findGuest(r, busy);   // link gone: same person by name
+      if (!g && deleted) continue;
       if (!g) {
         const p = String(r.name || "").trim().split(/\s+/);
         g = { id: "o:" + r.token, full_name: String(r.name || "").trim(), first_name: p[0] || "", last_name: p.slice(1).join(" "),
@@ -1044,7 +1051,7 @@ function mirrorSheet(data) {
   const linked = new Set(Object.values(S.links));
   const drop = new Set();
   for (const g of S.guests) {
-    if (linkToks && g.token && !linkToks.has(g.token)) {          // link row deleted in the Sheet
+    if (linkToks && g.token && !linkToks.has(g.token) && !toks.has(g.token)) {   // link deleted and never answered
       if (g.open || isDerived(g)) { drop.add(g.id); continue; }
       g.token = null; dirty(g); changed++;
     }
@@ -2048,7 +2055,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-29d";
+const BUILD = "2026-10-29e";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
