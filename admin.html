@@ -331,6 +331,10 @@ main{padding-bottom:60px}
     <button type="button" class="btn sm primary" id="resumeBtn">متابعة الإرسال</button>
     <button type="button" class="btn sm ghost" id="resumeDrop">إلغاء</button>
   </div>
+  <div class="banner" id="dupBanner" hidden style="background:#3A1A1F;border-color:#8A3A48;color:#F7C3CA">
+    <span class="grow" id="dupText"></span>
+    <button type="button" class="btn sm primary" id="dupFix">دمج المكررين</button>
+  </div>
   <div class="banner" id="sharedBanner" hidden>
     <span class="grow" id="sharedText"></span>
     <button type="button" class="btn sm primary" id="sharedAdd">إضافتهم إلى القائمة المشتركة</button>
@@ -577,6 +581,7 @@ main{padding-bottom:60px}
     <div style="display:flex;flex-wrap:wrap;gap:10px">
       <button type="button" class="btn" id="backupBtn">حفظ نسخة احتياطية</button>
       <button type="button" class="btn" id="restoreBtn">استعادة نسخة</button>
+      <button type="button" class="btn" id="dupFix2">دمج الضيوف المكررين</button>
       <input type="file" id="restoreFile" accept=".json" hidden>
       <button type="button" class="btn danger" id="resetBtn">مسح بيانات هذا المتصفح</button>
     </div>
@@ -782,7 +787,7 @@ const shared = () => sheetReady() && S.sharedOn;
 const dirty = (g) => { if (g && !isDerived(g)) g._dirty = 1; };
 const toRow = (g) => { const o = {}; SHARED_KEYS.forEach((k) => (o[k] = g[k] == null ? "" : String(g[k]))); return o; };
 const pickSettings = () => { const o = {}; SHARED_SETTINGS.forEach((k) => (o[k] = S.settings[k] ?? "")); return o; };
-let flushing = false, flushAgain = false;
+let flushing = false, flushAgain = false, lastFlushEnd = 0;
 async function flush() {
   if (!shared()) return;
   if (flushing) { flushAgain = true; return; }
@@ -792,9 +797,16 @@ async function flush() {
       flushAgain = false;
       const list = S.guests.filter((g) => g._dirty && !isDerived(g));
       if (list.length) {
-        const snap = list.map((g) => [g, JSON.stringify(toRow(g))]);
-        await api({ action: "upsertGuests", guests: list.map(toRow) });
-        snap.forEach(([g, j]) => { if (JSON.stringify(toRow(g)) === j) delete g._dirty; });
+        const snap = list.map((g) => [g, toRow(g)]);
+        // only the fields this laptop changed, so two admins editing the same guest don't overwrite each other
+        const payload = snap.map(([g, row]) => {
+          if (!g._base) return row;
+          const d = { id: row.id }; for (const k of SHARED_KEYS) if (row[k] !== (g._base[k] ?? "")) d[k] = row[k];
+          return d;
+        }).filter((d) => Object.keys(d).length > 1 || !snap.find(([g]) => String(g.id) === d.id)[0]._base);
+        if (payload.length) await api({ action: "upsertGuests", guests: payload });
+        snap.forEach(([g, row]) => { g._base = row; if (JSON.stringify(toRow(g)) === JSON.stringify(row)) delete g._dirty; });
+        lastFlushEnd = Date.now();
         await persist();
       }
       if (S.settingsDirty) {
@@ -817,8 +829,10 @@ function mergeFromSheet(data) {
     const g = { ...(old || {}) };
     SHARED_KEYS.forEach((k) => (g[k] = row[k] == null ? "" : String(row[k])));
     g.id = id; g.open = false;
+    g._base = toRow(g);
     g.phone = g.phone ? (normalizePhone(g.phone, S.settings.country_code) || g.phone.replace(/\D/g, "")) : "";
     g.token = g.token || null;
+    g._base = toRow(g);   // what the Sheet holds now: changes are measured against this
     const p = g.full_name.trim().split(/\s+/); g.first_name = p[0] || ""; g.last_name = p.slice(1).join(" ");
     list.push(g);
   }
@@ -856,6 +870,27 @@ function joinLocalGuests() {
   S.guests.push(...add);
   setTimeout(() => toast(`تمت إضافة ${add.length} ضيف من هذا الجهاز إلى القائمة المشتركة`), 300);
   if (sheetReady()) setTimeout(() => ensureLinks(add.filter((g) => !g.token)).catch(() => {}), 1500);
+}
+function dupCount() {
+  const seen = new Set(); let n = 0;
+  for (const g of S.guests) {
+    if (g.open || isDerived(g)) continue;
+    const k = g.phone || "n:" + normName(g.full_name);
+    if (seen.has(k)) n++; else seen.add(k);
+  }
+  return n;
+}
+async function fixDuplicates() {
+  if (!shared()) return toast("أدخل مفتاح الإدارة وحدّث Code.gs أولًا");
+  const b = $("#dupFix"); b.disabled = true; toast("جارٍ دمج المكررين…");
+  try {
+    await flush();
+    const r = await api({ action: "dedupeGuests" });
+    selected.clear(); S.session = null;
+    await syncReplies(true);
+    toast(r.removed ? `تم دمج ${r.groups} ضيف وحذف ${r.removed} نسخة مكررة` : "لا يوجد مكررون");
+  } catch (err) { toast(err.message.includes("رابط") ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
+  finally { b.disabled = false; render(); }
 }
 async function addLocalOnly() { joinLocalGuests(); await save(); }
 
@@ -937,7 +972,7 @@ function applyReply(g, r) {
   return changed;
 }
 
-let lastLinkToks = null;
+let lastLinkToks = null, lastLinkPhone = {};
 function applyReplies(replies) {
   S.replies = replies;
   const ids = new Set(S.guests.map((g) => g.id));
@@ -949,6 +984,7 @@ function applyReplies(replies) {
     let g = null;
     if (r.token) {
       g = S.guests.find((x) => x.token === r.token);
+      if (!g && lastLinkPhone[r.token]) g = S.guests.find((x) => !x.open && !isDerived(x) && x.phone === lastLinkPhone[r.token]);
       if (!g) {
         const p = String(r.name || "").trim().split(/\s+/);
         g = { id: "o:" + r.token, full_name: String(r.name || "").trim(), first_name: p[0] || "", last_name: p.slice(1).join(" "),
@@ -1013,14 +1049,18 @@ async function syncReplies(silent) {
   if (silent && document.querySelector("dialog[open]:not(#sessionDlg)")) return;   // never swap the list under an open form
   syncing = true; renderSync();
   try {
+    const startedAt = Date.now();
     const url = linkBase() + "?action=replies&key=" + encodeURIComponent(S.settings.sheet_key.trim());
     let data;
     try { data = await (await fetch(url, { cache: "no-store" })).json(); }
     catch { throw new Error("تعذّر الوصول إلى الجدول. تأكد من الاتصال بالإنترنت."); }
     if (!data.ok) throw new Error(data.error === "bad key" ? "مفتاح الإدارة غير صحيح" : (data.error || "لم يستجب الجدول"));
     lastLinkToks = Array.isArray(data.links) ? new Set(data.links.map((l) => l.token)) : null;
+    lastLinkPhone = {}; (data.links || []).forEach((l) => { if (l.phone && l.kind !== "open") lastLinkPhone[l.token] = l.phone; });
     S.oldServer = !Array.isArray(data.guests);
     lastSyncError = "";
+    // a save finished while this read was in flight: the read may be older than our save, so read again
+    if (!S.oldServer && (flushing || lastFlushEnd >= startedAt) && S.sharedOn) { syncing = false; setTimeout(() => syncReplies(true), 1200); return; }
     if (!S.oldServer) adoptShared(data);
     applyLinkInfo(data.links);
     const res = applyReplies(data.replies || []);
@@ -1113,6 +1153,9 @@ function render() {
   $("#tWishes").textContent = wishes;
   $("#tWishes").hidden = !wishes; $("#tOpen").hidden = !S.openLinks.length;
 
+  const dups = dupCount();
+  $("#dupBanner").hidden = !(dups && shared());
+  $("#dupText").textContent = `يوجد ${dups} ${dups === 1 ? "ضيف مكرر" : "ضيوف مكررين"} في القائمة (نفس رقم الجوال). الدمج يحتفظ بالرد والتذكرة وعلامات الإرسال.`;
   const lo = S.localOnly && S.localOnly.length;
   $("#sharedBanner").hidden = !(lo || (sheetReady() && S.oldServer));
   $("#sharedAdd").hidden = $("#sharedSkip").hidden = !lo;
@@ -1484,6 +1527,8 @@ document.addEventListener("visibilitychange", () => {
 });
 $("#resumeBtn").onclick = openSession;
 $("#sharedAdd").onclick = addLocalOnly;
+$("#dupFix").onclick = () => { if (confirm("دمج الضيوف المكررين؟ يبقى لكل ضيف سجل واحد بردّه وتذكرته وعلامات الإرسال.")) fixDuplicates(); };
+$("#dupFix2").onclick = () => { $("#setDlg").close(); if (confirm("دمج الضيوف المكررين؟ يبقى لكل ضيف سجل واحد بردّه وتذكرته وعلامات الإرسال.")) fixDuplicates(); };
 $("#sharedSkip").onclick = async () => {
   if (!confirm("تجاهل هؤلاء الضيوف؟ لن يُضافوا إلى القائمة المشتركة.")) return;
   S.localOnly = null; await persist(); render();
@@ -1939,7 +1984,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-28b";
+const BUILD = "2026-10-29a";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
