@@ -580,6 +580,7 @@ main{padding-bottom:60px}
     <p class="hint" style="margin-bottom:12px">قائمة الضيوف والرسائل محفوظة في جدول Google ومشتركة بين كل من يستخدم اللوحة بمفتاح الإدارة. النسخة الاحتياطية اختيارية.</p>
     <div style="display:flex;flex-wrap:wrap;gap:10px">
       <button type="button" class="btn primary" id="rebuildBtn">إصلاح القائمة والأعداد من الردود</button>
+      <button type="button" class="btn" id="recoverBtn">استعادة علامات «أُرسلت» المفقودة</button>
       <button type="button" class="btn" id="backupBtn">حفظ نسخة احتياطية</button>
       <button type="button" class="btn" id="restoreBtn">استعادة نسخة</button>
       <button type="button" class="btn" id="dupFix2">دمج الضيوف المكررين</button>
@@ -859,8 +860,9 @@ function mergeFromSheet(data) {
     list.push(g);
   }
   const sheetToks = new Set(list.map((g) => g.token).filter(Boolean));
-  // keep only guests added here and not saved yet; a guest that was in the Sheet and is gone now was removed there (merge/repair/delete)
-  for (const g of prev.values()) if (!seen.has(String(g.id)) && ((g._dirty && !g._base && String(g.full_name || "").trim()) || (isDerived(g) && !sheetToks.has(g.token)))) list.push(g);
+  // keep changes not saved yet (they are saved to the right person even if this guest was merged meanwhile);
+  // a saved guest that is gone from the Sheet was removed there (merge/repair/delete)
+  for (const g of prev.values()) if (!seen.has(String(g.id)) && ((g._dirty && String(g.full_name || "").trim()) || (isDerived(g) && !sheetToks.has(g.token)))) list.push(g);
   S.guests = list;
 }
 function adoptShared(data) {
@@ -1121,6 +1123,7 @@ async function syncReplies(silent) {
     lastSyncError = "";
     // a save finished while this read was in flight: the read may be older than our save, so read again
     if (!S.oldServer && (flushing || lastFlushEnd >= startedAt) && S.sharedOn) { syncing = false; setTimeout(() => syncReplies(true), 1200); return; }
+    if (!S.oldServer && data.version >= 11 && data.settings && !data.settings.restore_v1 && !restoreStarted) { syncing = false; runRestore(); return; }
     if (!S.oldServer) adoptShared(data);
     applyLinkInfo(data.links);
     const res = applyReplies(data.replies || []);
@@ -1650,6 +1653,39 @@ $("#rbGo").onclick = async () => {
     $("#infoText").style.whiteSpace = "pre-line";
   } catch (err) { toast(err.message); }
 };
+/* One-time restore of everyone lost along the way (runs by itself once, on whichever laptop opens first) */
+let restoreStarted = false;
+async function runRestore() {
+  restoreStarted = true;
+  toast("جارٍ استعادة الضيوف المفقودين… لا تغلق الصفحة");
+  try {
+    await flush();
+    const r = await api({ action: "restoreAll" });
+    selected.clear(); S.session = null;
+    await syncReplies(true);
+    if (r.skipped) return;
+    const amb = (r.ambiguous || []).map((a) => `ردّ «${a.reply}» لم يُربط: يوجد أكثر من ضيف بهذا الاسم`);
+    info("تمت استعادة الضيوف", [
+      `أُعيد ${r.fromCopies + r.fromLinks} ضيف إلى القائمة، واستُعيدت علامة «أُرسلت» لـ ${r.sentMarks}، وأُعيد ${r.relinked} رابط محذوف.`,
+      `القائمة الآن ${r.after} ضيف: ${r.counts.attending} سيحضر · ${r.counts.declined} اعتذر · ${r.counts.pending} لم يرد.`,
+      `نسخة احتياطية قبل الاستعادة في تبويب «${r.backup}».`].join("\n"), amb);
+    $("#infoText").style.whiteSpace = "pre-line";
+  } catch (err) { restoreStarted = false; toast(err.message); }
+}
+$("#recoverBtn").onclick = async () => {
+  $("#setDlg").close(); toast("جارٍ البحث…");
+  try {
+    await flush();
+    const pv = await api({ action: "recoverSent", preview: true });
+    if (!pv.count) { info("استعادة علامات «أُرسلت»", "لا توجد علامات إرسال مفقودة في النسخ الاحتياطية."); return; }
+    if (!confirm(`وُجد ${pv.count} ضيف أُرسلت لهم الدعوة وفُقدت علامتهم. استعادتها الآن؟`)) return;
+    toast("جارٍ الاستعادة…");
+    const r = await api({ action: "recoverSent" });
+    selected.clear(); S.session = null;
+    await syncReplies(true);
+    info("تمت الاستعادة", `أُعيدت علامة «أُرسلت» لـ ${r.count} ضيف${r.added ? ` (منهم ${r.added} أُعيدوا إلى القائمة)` : ""}.`, r.names);
+  } catch (err) { toast(/رابط|Apps|Unknown/i.test(err.message) ? "حدّث Code.gs في Apps Script ثم انشر نسخة جديدة" : err.message); }
+};
 $("#repairBtn").onclick = async () => {
   if (!confirm("استعادة الضيوف الذين حذفهم الدمج من تبويب «نسخة من الضيوف»؟ الردود والتسجيلات الحالية لا تتأثر، وتُحفظ نسخة احتياطية أولًا.")) return;
   $("#setDlg").close(); toast("جارٍ الاستعادة…");
@@ -2116,7 +2152,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-30b";
+const BUILD = "2026-10-30d";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
