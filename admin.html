@@ -1124,6 +1124,7 @@ async function syncReplies(silent) {
     // a save finished while this read was in flight: the read may be older than our save, so read again
     if (!S.oldServer && (flushing || lastFlushEnd >= startedAt) && S.sharedOn) { syncing = false; setTimeout(() => syncReplies(true), 1200); return; }
     if (!S.oldServer && data.version >= 11 && data.settings && !data.settings.restore_v1 && !restoreStarted) { syncing = false; runRestore(); return; }
+    if (!S.oldServer && data.version >= 12 && data.settings && data.settings.restore_v1 && !data.settings.restore_v2 && !restoreStarted) { syncing = false; runMarkSent(); return; }
     if (!S.oldServer) adoptShared(data);
     applyLinkInfo(data.links);
     const res = applyReplies(data.replies || []);
@@ -1672,6 +1673,14 @@ async function runRestore() {
     $("#infoText").style.whiteSpace = "pre-line";
   } catch (err) { restoreStarted = false; toast(err.message); }
 }
+async function runMarkSent() {
+  restoreStarted = true;
+  try {
+    const r = await api({ action: "markRestoredSent" });
+    await syncReplies(true);
+    if (!r.skipped && r.count) info("تم تحديث حالة الإرسال", `وُضعت علامة «أُرسلت» على ${r.count} ضيف أُعيدوا من تبويب الروابط.`, r.names);
+  } catch (err) { restoreStarted = false; toast(err.message); }
+}
 $("#recoverBtn").onclick = async () => {
   $("#setDlg").close(); toast("جارٍ البحث…");
   try {
@@ -2152,7 +2161,7 @@ setInterval(renderSync, 10000);
 window.addEventListener("focus", () => syncReplies(true));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncReplies(true); });
 
-const BUILD = "2026-10-30d";
+const BUILD = "2026-10-30e";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" })).text();
